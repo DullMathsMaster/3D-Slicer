@@ -2,19 +2,17 @@
 
 import RPi.GPIO as GPIO
 import time
-import threading
 
 # --- Pins ---
-MOTOR_X_PINS = [17, 18, 27, 22]
-MOTOR_Y_PINS = [5, 6, 13, 19]
+MOTOR_X_PINS = [2, 3, 4, 14]
+MOTOR_Y_PINS = [15, 18, 17, 27]
 
-X_LIMIT   = 23
-Y_LIMIT   = 25
+X_LIMIT     = 22
+Y_LIMIT     = 23
 
-BTN_X_CW  = 12
-BTN_X_CCW = 16
-BTN_Y_CW  = 20
-BTN_Y_CCW = 21
+CALIBRATE_Z = 10
+Z_DOWN      = 9
+Z_UP        = 11
 
 # --- Constants ---
 MAX_ROTATIONS = 80
@@ -40,8 +38,12 @@ for pin in MOTOR_X_PINS + MOTOR_Y_PINS:
     GPIO.setup(pin, GPIO.OUT)
     GPIO.output(pin, GPIO.LOW)
 
-for pin in [X_LIMIT, Y_LIMIT, BTN_X_CW, BTN_X_CCW, BTN_Y_CW, BTN_Y_CCW]:
+for pin in [X_LIMIT, Y_LIMIT]:
     GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+for pin in [CALIBRATE_Z, Z_DOWN, Z_UP]:
+    GPIO.setup(pin, GPIO.OUT)
+    GPIO.output(pin, GPIO.LOW)
 
 # --- Motor Controller ---
 class MotorController:
@@ -49,15 +51,11 @@ class MotorController:
     CCW = -1
 
     def __init__(self, name, pins, limit_pin):
-        self.name             = name
-        self.pins             = pins
-        self.limit_pin        = limit_pin
-        self._step_idx        = 0
+        self.name              = name
+        self.pins              = pins
+        self.limit_pin         = limit_pin
+        self._step_idx         = 0
         self._steps_from_bound = 0
-        self._running         = False
-        self._direction       = 0
-        self._thread          = None
-        self._lock            = threading.Lock()
 
     def _at_limit(self):
         return GPIO.input(self.limit_pin) == GPIO.LOW
@@ -78,80 +76,123 @@ class MotorController:
         else:
             self._steps_from_bound = max(0, self._steps_from_bound - 1)
 
-    def _run(self):
-        while self._running:
-            if self._direction == self.CCW:
-                if self._at_limit():
+    def move(self, direction, steps):
+        label = "forward" if direction == self.CW else "backward"
+        print(f"[Motor {self.name}] {label} {steps / STEPS_PER_REV:.2f} turns ({steps} steps)...")
+        try:
+            for _ in range(steps):
+                if direction == self.CCW and self._at_limit():
                     self._steps_from_bound = 0
-                    print(f"[Motor {self.name}] Limit reached, stopping CCW")
-                    self._running = False
+                    print(f"[Motor {self.name}] Limit reached, stopping early")
                     break
-            elif self._direction == self.CW:
-                if self._steps_from_bound >= MAX_ROTATIONS * STEPS_PER_REV:
-                    print(f"[Motor {self.name}] {MAX_ROTATIONS}-rotation cap reached, stopping CW")
-                    self._running = False
+                if direction == self.CW and self._steps_from_bound >= MAX_ROTATIONS * STEPS_PER_REV:
+                    print(f"[Motor {self.name}] {MAX_ROTATIONS}-rotation cap reached, stopping early")
                     break
-            self._do_step(self._direction)
-            time.sleep(STEP_DELAY)
-        self._release_coils()
+                self._do_step(direction)
+                time.sleep(STEP_DELAY)
+        finally:
+            self._release_coils()
+        print(f"[Motor {self.name}] Done")
 
-    def start(self, direction):
-        with self._lock:
-            if direction == self.CCW and self._at_limit():
-                print(f"[Motor {self.name}] CCW blocked – limit switch active")
-                return
-            if direction == self.CW and self._steps_from_bound >= MAX_ROTATIONS * STEPS_PER_REV:
-                print(f"[Motor {self.name}] CW blocked – rotation cap reached")
-                return
-            self._running = False
-            if self._thread and self._thread.is_alive():
-                self._thread.join(timeout=1.0)
-            self._direction = direction
-            self._running   = True
-            self._thread    = threading.Thread(target=self._run, daemon=True)
-            self._thread.start()
+    def calibrate(self):
+        print(f"[Motor {self.name}] Calibrating – moving forward until limit...")
+        try:
+            while not self._at_limit():
+                self._do_step(self.CW)
+                time.sleep(STEP_DELAY)
+        finally:
+            self._release_coils()
+        print(f"[Motor {self.name}] Limit hit – backing off...")
+        try:
+            while self._at_limit():
+                self._do_step(self.CCW)
+                time.sleep(STEP_DELAY)
+        finally:
+            self._release_coils()
+        self._steps_from_bound = 0
+        print(f"[Motor {self.name}] Calibration complete")
 
-    def stop(self):
-        self._running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
-        self._release_coils()
+# --- Z-axis signal to Pico ---
+def pulse_pin(pin, duration=0.4):
+    GPIO.output(pin, GPIO.HIGH)
+    time.sleep(duration)
+    GPIO.output(pin, GPIO.LOW)
 
 # --- Instantiate ---
 motor_x = MotorController("X", MOTOR_X_PINS, X_LIMIT)
 motor_y = MotorController("Y", MOTOR_Y_PINS, Y_LIMIT)
 
-# --- Button Callbacks ---
-_BUTTON_MAP = {
-    BTN_X_CW:  (motor_x, MotorController.CW),
-    BTN_X_CCW: (motor_x, MotorController.CCW),
-    BTN_Y_CW:  (motor_y, MotorController.CW),
-    BTN_Y_CCW: (motor_y, MotorController.CCW),
-}
+# --- Command Parser ---
+def parse_command(cmd):
+    parts = cmd.strip().lower().split()
+    if not parts:
+        return
 
-def _btn_event(channel):
-    motor, direction = _BUTTON_MAP[channel]
-    if GPIO.input(channel) == GPIO.LOW:
-        motor.start(direction)
-    else:
-        motor.stop()
+    if parts[0] == "up":
+        print("Signalling Pico: UP")
+        pulse_pin(Z_UP)
+        return
 
-for btn_pin in _BUTTON_MAP:
-    GPIO.add_event_detect(btn_pin, GPIO.BOTH, callback=_btn_event, bouncetime=50)
+    if parts[0] == "down":
+        print("Signalling Pico: DOWN")
+        pulse_pin(Z_DOWN)
+        return
+
+    if parts[0] == "calibrate":
+        if len(parts) == 1:
+            print("Signalling Pico: CALIBRATE")
+            pulse_pin(CALIBRATE_Z)
+        elif parts[1] == "x":
+            motor_x.calibrate()
+        elif parts[1] == "y":
+            motor_y.calibrate()
+        else:
+            print("Usage: calibrate | calibrate x | calibrate y")
+        return
+
+    if parts[0] in ("x", "y"):
+        if len(parts) != 3:
+            print("Usage: x/y forward/backward <turns>")
+            return
+        motor = motor_x if parts[0] == "x" else motor_y
+        if parts[1] == "forward":
+            direction = MotorController.CW
+        elif parts[1] == "backward":
+            direction = MotorController.CCW
+        else:
+            print("Direction must be 'forward' or 'backward'")
+            return
+        try:
+            turns = float(parts[2])
+            if turns <= 0:
+                raise ValueError
+        except ValueError:
+            print("Turns must be a positive number e.g. 2.1")
+            return
+        motor.move(direction, int(turns * STEPS_PER_REV))
+        return
+
+    print(f"Unknown command: '{cmd}'")
+    print("Commands: x/y forward/backward <turns> | calibrate [x|y] | up | down")
 
 # --- Main ---
 print("X-Y Rack Controller – Raspberry Pi 2B")
-print(f"X CW: GPIO {BTN_X_CW} | X CCW: GPIO {BTN_X_CCW} | Limit: GPIO {X_LIMIT}")
-print(f"Y CW: GPIO {BTN_Y_CW} | Y CCW: GPIO {BTN_Y_CCW} | Limit: GPIO {Y_LIMIT}")
-print(f"Max CW rotations from bound: {MAX_ROTATIONS} | Ctrl-C to exit\n")
+print(f"X Limit: GPIO {X_LIMIT} | Y Limit: GPIO {Y_LIMIT}")
+print(f"Z Calibrate: GPIO {CALIBRATE_Z} | Z Down: GPIO {Z_DOWN} | Z Up: GPIO {Z_UP}")
+print("Commands: x/y forward/backward <turns> | calibrate [x|y] | up | down")
+print("Ctrl-C to exit\n")
 
 try:
     while True:
-        time.sleep(0.1)
+        try:
+            cmd = input("> ")
+            parse_command(cmd)
+        except EOFError:
+            break
 except KeyboardInterrupt:
     print("\nShutting down...")
 finally:
-    motor_x.stop()
-    motor_y.stop()
+    for pin in MOTOR_X_PINS + MOTOR_Y_PINS:
+        GPIO.output(pin, GPIO.LOW)
     GPIO.cleanup()
     print("GPIO cleaned up.")
